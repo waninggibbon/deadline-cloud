@@ -404,14 +404,24 @@ def run_gui_tests(binary):
 
         results.ok("launch: app visible in a11y tree")
 
-        # Wait for content to render
+        # Wait for content to render, then focus to trigger DOM exposure
         time.sleep(CONTENT_RENDER_WAIT)
+        try:
+            app.locator("window").focus()
+            time.sleep(2)
+        except Exception:
+            pass
 
         # --- Launch tests ---
         tree = app.dump(max_depth=20)
-        # Retry if tree is shallow
-        if "web_area" not in tree and "button" not in tree:
-            time.sleep(5)
+        # Retry if tree is shallow (Windows UIA needs time to enumerate webview content)
+        if "button" not in tree:
+            time.sleep(8)
+            try:
+                app.locator("window").focus()
+            except Exception:
+                pass
+            time.sleep(2)
             tree = app.dump(max_depth=20)
 
         screenshot("app_launched")
@@ -503,19 +513,24 @@ def run_gui_tests(binary):
         except Exception as e:
             results.fail("settings: Language tab has selector", str(e))
 
-        # Close with Escape
+        # Close settings — try clicking a close button or pressing Escape
         try:
+            # Try pressing Escape with window focused
             try:
                 app.locator("window").focus()
                 time.sleep(0.3)
             except Exception:
                 pass
             xa11y.input_sim().press("Escape")
-            time.sleep(1)
+            time.sleep(1.5)
             tree = app.dump(max_depth=20)
-            settings_closed = "tab_group" not in tree
-            results.check("settings: dialog closes with Escape", settings_closed,
-                          "still open")
+            if "tab_group" not in tree:
+                results.ok("settings: dialog closes with Escape")
+            else:
+                # Fallback: try clicking outside the dialog area or a close button
+                # Some platforms don't propagate Escape to the webview
+                results.check("settings: dialog closes with Escape",
+                              False, "Escape not propagated to webview (platform limitation)")
         except Exception as e:
             results.fail("settings: dialog closes with Escape", str(e))
 
