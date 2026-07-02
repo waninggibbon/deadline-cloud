@@ -434,8 +434,32 @@ def run_gui_tests(binary):
 
         has_dom = "web_area" in tree
         if not has_dom:
+            # Print diagnostic info for debugging
+            print(f"    [DEBUG] Full a11y tree ({len(tree)} chars):", flush=True)
+            print(f"    {tree[:1000]}", flush=True)
+            if IS_LINUX:
+                print(f"    [DEBUG] WEBKIT_A11Y_BUS_ADDRESS={os.environ.get('WEBKIT_A11Y_BUS_ADDRESS', '<not set>')}", flush=True)
+                print(f"    [DEBUG] AT_SPI_BUS_ADDRESS={os.environ.get('AT_SPI_BUS_ADDRESS', '<not set>')}", flush=True)
+                print(f"    [DEBUG] DBUS_SESSION_BUS_ADDRESS={os.environ.get('DBUS_SESSION_BUS_ADDRESS', '<not set>')}", flush=True)
+                # Try querying the AT-SPI bus to see if webkitgtk's web process registered
+                try:
+                    import subprocess as _sp
+                    r = _sp.run(["dbus-send", "--session", "--dest=org.a11y.Bus", "--print-reply",
+                                 "/org/a11y/bus", "org.a11y.Bus.GetAddress"],
+                                capture_output=True, text=True, timeout=5)
+                    print(f"    [DEBUG] GetAddress result: {r.stdout.strip()}", flush=True)
+                except Exception as e:
+                    print(f"    [DEBUG] GetAddress failed: {e}", flush=True)
+                # List all apps in the AT-SPI tree
+                print(f"    [DEBUG] All a11y apps:", flush=True)
+                for a in xa11y.App.list():
+                    try:
+                        subtree = a.dump(max_depth=3)
+                        print(f"      {a.name!r} pid={a.pid}: {subtree[:200]}", flush=True)
+                    except Exception as e:
+                        print(f"      {a.name!r} pid={a.pid}: dump failed: {e}", flush=True)
+
             # webkitgtk on Linux doesn't expose DOM via AT-SPI on GitHub runners.
-            # This is a known platform limitation, not a test failure.
             results.skip("launch: window has web_area (DOM exposed)",
                          "webkitgtk DOM not exposed via AT-SPI (platform limitation)")
             _skip_remaining_gui("DOM not exposed via accessibility")
