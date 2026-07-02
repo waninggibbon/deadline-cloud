@@ -27,6 +27,9 @@ jobs:
       WEBKIT_DISABLE_COMPOSITING_MODE: '1'
       WEBKIT_FORCE_SANDBOX: '0'
       LIBGL_ALWAYS_SOFTWARE: '1'
+      # Workaround: direct webkitgtk web process to register on session bus
+      # instead of the dedicated AT-SPI bus (registryd may not be on the latter)
+      XA11Y_USE_SESSION_BUS: '1'
       SCREENSHOT_DIR: /tmp/dcm-screenshots
     steps:
       - uses: actions/checkout@v7
