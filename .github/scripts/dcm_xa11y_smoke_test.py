@@ -433,6 +433,21 @@ def run_gui_tests(binary):
         screenshot("app_launched")
 
         has_dom = "web_area" in tree
+        if not has_dom and IS_LINUX:
+            # On Linux, the web process may need additional time or activation.
+            # Try repeated dumps with increasing delays.
+            print(f"    [DEBUG] web_area not found on first dump, retrying...", flush=True)
+            for attempt in range(4):
+                time.sleep(5)
+                # Each dump() call acts as an AT-SPI client query which may
+                # trigger the web process to activate its accessibility tree
+                tree = app.dump(max_depth=20)
+                if "web_area" in tree:
+                    has_dom = True
+                    print(f"    [DEBUG] web_area appeared after {(attempt+1)*5}s extra wait", flush=True)
+                    break
+                print(f"    [DEBUG] retry {attempt+1}: still no web_area ({len(tree)} chars)", flush=True)
+
         if not has_dom:
             # Print diagnostic info for debugging
             print(f"    [DEBUG] Full a11y tree ({len(tree)} chars):", flush=True)
