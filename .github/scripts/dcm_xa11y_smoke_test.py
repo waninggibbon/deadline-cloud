@@ -168,6 +168,12 @@ class DCMApp:
         if IS_LINUX:
             env["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
             env["WEBKIT_FORCE_SANDBOX"] = "0"
+            env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+            env["NO_AT_BRIDGE"] = "0"
+            # Pass the AT-SPI bus address if available (critical for webkitgtk DOM exposure)
+            for var in ("WEBKIT_A11Y_BUS_ADDRESS", "AT_SPI_BUS_ADDRESS"):
+                if os.environ.get(var):
+                    env[var] = os.environ[var]
 
         # Record PIDs of any already-running DCM instances to exclude them
         existing_pids = set()

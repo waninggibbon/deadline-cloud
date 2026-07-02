@@ -21,10 +21,12 @@ jobs:
       GTK_A11Y: atk
       GNOME_ACCESSIBILITY: '1'
       ACCESSIBILITY_ENABLED: '1'
+      NO_AT_BRIDGE: '0'
       MOZ_ENABLE_WAYLAND: '0'
-      # Force webkitgtk to expose DOM content via AT-SPI accessibility tree
+      # Prevent webkitgtk web process GPU crashes under Xvfb
       WEBKIT_DISABLE_COMPOSITING_MODE: '1'
       WEBKIT_FORCE_SANDBOX: '0'
+      LIBGL_ALWAYS_SOFTWARE: '1'
       SCREENSHOT_DIR: /tmp/dcm-screenshots
     steps:
       - uses: actions/checkout@v7
@@ -40,18 +42,52 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb dbus-x11 at-spi2-core \
             libayatana-appindicator3-1 libwebkit2gtk-4.0-37 desktop-file-utils \
-            libatk-bridge2.0-0 libatspi2.0-0 libgtk-3-0 gir1.2-atspi-2.0
+            libatk-bridge2.0-0 libatspi2.0-0 libgtk-3-0 gir1.2-atspi-2.0 \
+            fluxbox
 
       - name: Start Xvfb + session bus + AT-SPI
         run: |
-          Xvfb :99 -screen 0 1920x1080x24 &
+          # 1. Xvfb first
+          Xvfb :99 -screen 0 1920x1080x24 -ac &
           sleep 1
+
+          # 2. D-Bus session bus
           eval "$(dbus-launch --sh-syntax)"
           echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
+
+          # 3. AT-SPI bus launcher (provides org.a11y.Bus on the session bus)
           /usr/libexec/at-spi-bus-launcher --launch-immediately &
-          sleep 1
-          /usr/libexec/at-spi2-registryd &
           sleep 2
+
+          # 4. AT-SPI registry daemon
+          /usr/libexec/at-spi2-registryd &
+          sleep 1
+
+          # 5. Enable AT-SPI status properties so webkitgtk activates accessibility
+          dbus-send --session --dest=org.a11y.Bus --type=method_call \
+            /org/a11y/bus org.freedesktop.DBus.Properties.Set \
+            string:"org.a11y.Status" string:"IsEnabled" variant:boolean:true 2>/dev/null || true
+          dbus-send --session --dest=org.a11y.Bus --type=method_call \
+            /org/a11y/bus org.freedesktop.DBus.Properties.Set \
+            string:"org.a11y.Status" string:"ScreenReaderEnabled" variant:boolean:true 2>/dev/null || true
+
+          # 6. Get the AT-SPI bus address and export it for the webkitgtk web process.
+          # This is the critical step — without this, webkitgtk's web process silently
+          # skips accessibility because it receives an empty bus address.
+          A11Y_BUS=$(dbus-send --session --dest=org.a11y.Bus --print-reply \
+            /org/a11y/bus org.a11y.Bus.GetAddress 2>/dev/null \
+            | grep string | sed 's/.*"\(.*\)"/\1/' || true)
+          if [ -n "$A11Y_BUS" ]; then
+            echo "AT-SPI bus address: $A11Y_BUS"
+            echo "WEBKIT_A11Y_BUS_ADDRESS=$A11Y_BUS" >> $GITHUB_ENV
+            echo "AT_SPI_BUS_ADDRESS=$A11Y_BUS" >> $GITHUB_ENV
+          else
+            echo "WARNING: Could not get AT-SPI bus address"
+          fi
+
+          # 7. Start a minimal window manager (helps with focus management)
+          fluxbox &
+          sleep 1
 
       - name: Install xa11y
         run: pip install 'xa11y>=0.8.1,<0.9'
