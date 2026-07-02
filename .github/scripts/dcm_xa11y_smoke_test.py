@@ -170,17 +170,13 @@ class DCMApp:
             env["WEBKIT_FORCE_SANDBOX"] = "0"
             env["LIBGL_ALWAYS_SOFTWARE"] = "1"
             env["NO_AT_BRIDGE"] = "0"
-            # The web process needs to connect to the AT-SPI bus where the
-            # registryd is running. Try the dedicated bus first, fall back
-            # to the session bus (where the ATK bridge registers GTK widgets).
-            for var in ("WEBKIT_A11Y_BUS_ADDRESS", "AT_SPI_BUS_ADDRESS"):
-                if os.environ.get(var):
-                    env[var] = os.environ[var]
-            # If the dedicated AT-SPI bus has no registryd, try the session bus
-            # (where xa11y already sees GTK widgets via the ATK bridge).
-            if os.environ.get("DBUS_SESSION_BUS_ADDRESS") and os.environ.get("XA11Y_USE_SESSION_BUS"):
-                env["WEBKIT_A11Y_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
-                env["AT_SPI_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
+            # Direct the web process to the session bus where xa11y and the
+            # ATK bridge are registered. The dedicated AT-SPI bus from
+            # at-spi-bus-launcher has no registryd in GitHub CI environments.
+            dbus_addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+            if dbus_addr:
+                env["WEBKIT_A11Y_BUS_ADDRESS"] = dbus_addr
+                env["AT_SPI_BUS_ADDRESS"] = dbus_addr
 
         # Record PIDs of any already-running DCM instances to exclude them
         existing_pids = set()
