@@ -497,6 +497,32 @@ def run_gui_tests(binary):
                             print(f"    [DEBUG] Socket not accessible: {r.stderr.strip()}", flush=True)
                 except Exception as e:
                     print(f"    [DEBUG] socket check failed: {e}", flush=True)
+                # Check if DCM binary links against libatspi
+                try:
+                    import subprocess as _sp
+                    dcm_bin = find_dcm_binary()
+                    r = _sp.run(["ldd", dcm_bin], capture_output=True, text=True, timeout=5)
+                    atspi_libs = [l.strip() for l in r.stdout.split("\n") if "atspi" in l.lower() or "atk" in l.lower()]
+                    print(f"    [DEBUG] DCM linked a11y libs: {atspi_libs}", flush=True)
+                    # Also check the WebKitWebProcess binary
+                    r2 = _sp.run(["ldd", "/usr/lib/x86_64-linux-gnu/webkit2gtk-4.0/WebKitWebProcess"],
+                                 capture_output=True, text=True, timeout=5)
+                    atspi_libs2 = [l.strip() for l in r2.stdout.split("\n") if "atspi" in l.lower() or "atk" in l.lower()]
+                    print(f"    [DEBUG] WebKitWebProcess linked a11y libs: {atspi_libs2}", flush=True)
+                except Exception as e:
+                    print(f"    [DEBUG] ldd check failed: {e}", flush=True)
+                # Check AT-SPI bus registrations
+                try:
+                    import subprocess as _sp
+                    bus_addr = os.environ.get("WEBKIT_A11Y_BUS_ADDRESS", "")
+                    if bus_addr:
+                        r = _sp.run(["dbus-send", f"--address={bus_addr}", "--print-reply",
+                                     "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                     "org.freedesktop.DBus.ListNames"],
+                                    capture_output=True, text=True, timeout=5)
+                        print(f"    [DEBUG] AT-SPI bus registered names: {r.stdout.strip()[:500]}", flush=True)
+                except Exception as e:
+                    print(f"    [DEBUG] AT-SPI bus list failed: {e}", flush=True)
                 # List all apps in the AT-SPI tree
                 print(f"    [DEBUG] All a11y apps:", flush=True)
                 for a in xa11y.App.list():
