@@ -1,0 +1,58 @@
+name: DCM Smoke Test (Windows)
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: Git ref (tag/branch/SHA) to test. Defaults to the triggering ref.
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  test:
+    name: DCM xa11y Smoke (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      SCREENSHOT_DIR: ${{ github.workspace }}\dcm-screenshots
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install xa11y
+        shell: pwsh
+        run: pip install 'xa11y>=0.8.1,<0.9'
+
+      - name: Install DCM
+        shell: pwsh
+        run: |
+          $manifest = Invoke-RestMethod https://downloads.deadlinecloud.amazonaws.com/manifest.json
+          $EXE = $manifest.latest.windows_x64
+          Write-Host "Installing DCM from: $EXE"
+          Invoke-WebRequest $EXE -OutFile dcm-setup.exe
+          Start-Process -Wait -FilePath .\dcm-setup.exe -ArgumentList '/S'
+          Start-Sleep -Seconds 5
+          "$env:LOCALAPPDATA\DeadlineCloudMonitor" | Out-File $env:GITHUB_PATH -Append
+
+      - name: Prepare screenshot dir
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path $env:SCREENSHOT_DIR
+
+      - name: Run xa11y smoke tests
+        shell: pwsh
+        run: python .github/scripts/dcm_xa11y_smoke_test.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dcm-smoke-screenshots-windows
+          path: ${{ env.SCREENSHOT_DIR }}\*.png
+          if-no-files-found: ignore

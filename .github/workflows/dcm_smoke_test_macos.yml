@@ -1,0 +1,73 @@
+name: DCM Smoke Test (macOS)
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: Git ref (tag/branch/SHA) to test. Defaults to the triggering ref.
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  test:
+    name: DCM xa11y Smoke (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      SCREENSHOT_DIR: /tmp/dcm-screenshots
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install xa11y
+        run: pip install 'xa11y>=0.8.1,<0.9'
+
+      - name: Grant accessibility TCC permission to Python
+        run: |
+          PYTHON_PATH=$(python3 -c "import os,sys; print(os.path.realpath(sys.executable))")
+          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+            "INSERT OR REPLACE INTO access(service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified) \
+            VALUES('kTCCServiceAccessibility','${PYTHON_PATH}',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$(date +%s));"
+          sudo launchctl stop com.apple.tccd 2>/dev/null || true
+          sleep 2
+
+      - name: Install DCM (.dmg)
+        run: |
+          DMG=$(curl -s https://downloads.deadlinecloud.amazonaws.com/manifest.json \
+            | python -c "import sys,json,urllib.parse as u; print(u.quote(json.load(sys.stdin)['latest']['mac_aarch64'], safe=':/'))")
+          echo "Installing DCM from: $DMG"
+          curl -sL "$DMG" -o /tmp/dcm.dmg
+          hdiutil attach /tmp/dcm.dmg -nobrowse -quiet
+          cp -R "/Volumes/Deadline Cloud Monitor/Deadline Cloud Monitor.app" /Applications/
+          hdiutil detach "/Volumes/Deadline Cloud Monitor" -quiet
+          echo "/Applications/Deadline Cloud Monitor.app/Contents/MacOS" >> $GITHUB_PATH
+
+      - name: Dismiss macOS Setup Assistant
+        run: |
+          if pgrep -x "Setup Assistant" > /dev/null 2>&1; then
+            echo "Setup Assistant is running — dismissing it"
+            sudo touch /var/db/.AppleSetupDone
+            sudo killall "Setup Assistant" 2>/dev/null || true
+            sleep 2
+          fi
+
+      - name: Prepare screenshot dir
+        run: mkdir -p $SCREENSHOT_DIR
+
+      - name: Run xa11y smoke tests
+        run: python .github/scripts/dcm_xa11y_smoke_test.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dcm-smoke-screenshots-macos
+          path: /tmp/dcm-screenshots/*.png
+          if-no-files-found: ignore

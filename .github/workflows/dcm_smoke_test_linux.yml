@@ -1,0 +1,73 @@
+name: DCM Smoke Test (Linux)
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: Git ref (tag/branch/SHA) to test. Defaults to the triggering ref.
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  test:
+    name: DCM xa11y Smoke (Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      DISPLAY: ':99'
+      GTK_MODULES: gail:atk-bridge
+      GTK_A11Y: atk
+      GNOME_ACCESSIBILITY: '1'
+      ACCESSIBILITY_ENABLED: '1'
+      MOZ_ENABLE_WAYLAND: '0'
+      SCREENSHOT_DIR: /tmp/dcm-screenshots
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb dbus-x11 at-spi2-core \
+            libayatana-appindicator3-1 libwebkit2gtk-4.0-37 desktop-file-utils
+
+      - name: Start Xvfb + session bus + AT-SPI
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 1
+          eval "$(dbus-launch --sh-syntax)"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
+          /usr/libexec/at-spi-bus-launcher --launch-immediately &
+          sleep 2
+
+      - name: Install xa11y
+        run: pip install 'xa11y>=0.8.1,<0.9'
+
+      - name: Install DCM (.deb)
+        run: |
+          DEB=$(curl -s https://downloads.deadlinecloud.amazonaws.com/manifest.json \
+            | python -c "import sys,json; print(json.load(sys.stdin)['latest']['linux_deb'])")
+          echo "Installing DCM from: $DEB"
+          curl -sL "$DEB" -o /tmp/dcm.deb
+          sudo apt-get install -y /tmp/dcm.deb
+
+      - name: Prepare screenshot dir
+        run: mkdir -p $SCREENSHOT_DIR
+
+      - name: Run xa11y smoke tests
+        run: python .github/scripts/dcm_xa11y_smoke_test.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dcm-smoke-screenshots-linux
+          path: /tmp/dcm-screenshots/*.png
+          if-no-files-found: ignore

@@ -1,0 +1,25 @@
+name: DCM Smoke Tests
+
+# Cross-platform xa11y smoke test suite for the DCM (Deadline Cloud Monitor)
+# app. Validates CLI commands and GUI accessibility on all three platforms
+# without requiring AWS credentials.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [mainline]
+    paths:
+      - '.github/workflows/dcm_smoke_test_*.yml'
+      - '.github/workflows/dcm_smoke_tests.yml'
+      - '.github/scripts/dcm_xa11y_smoke_test.py'
+
+jobs:
+  linux:
+    uses: ./.github/workflows/dcm_smoke_test_linux.yml
+    secrets: inherit
+  macos:
+    uses: ./.github/workflows/dcm_smoke_test_macos.yml
+    secrets: inherit
+  windows:
+    uses: ./.github/workflows/dcm_smoke_test_windows.yml
+    secrets: inherit
