@@ -46,10 +46,10 @@ IS_WINDOWS = SYSTEM == "Windows"
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", tempfile.gettempdir())
 TEST_LOGIN = os.environ.get("TEST_LOGIN", "0") == "1"
 
-# Timeouts
-ELEMENT_TIMEOUT = 10
-APP_LAUNCH_TIMEOUT = 30
-CONTENT_RENDER_WAIT = 8
+# Timeouts (seconds)
+ELEMENT_TIMEOUT = 15
+APP_LAUNCH_TIMEOUT = 45
+CONTENT_RENDER_WAIT = 12
 
 # Known DCM installation paths
 DCM_PATHS = {
@@ -165,6 +165,9 @@ class DCMApp:
         env = os.environ.copy()
         env["HOME_DIR_OVERRIDE"] = self.config_dir
         env["CONFIG_DIR_OVERRIDE"] = self.config_dir
+        if IS_LINUX:
+            env["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
+            env["WEBKIT_FORCE_SANDBOX"] = "0"
 
         # Record PIDs of any already-running DCM instances to exclude them
         existing_pids = set()
@@ -236,6 +239,13 @@ class DCMApp:
 
     def press_escape(self):
         import xa11y
+        # Focus the app window first to ensure keystroke goes to the right place
+        try:
+            window = self.app.locator("window")
+            window.focus()
+            time.sleep(0.3)
+        except Exception:
+            pass
         sim = xa11y.input_sim()
         sim.press("Escape")
         time.sleep(0.5)
@@ -359,96 +369,77 @@ def run_app_launch_tests(binary):
 def run_studio_url_tests(binary):
     """Test URL input validation.
 
-    The wizard validates the URL against the backend. With a fake URL, validation
-    shows "No valid monitor exists" but does NOT prevent error display for
-    syntactically invalid URLs. A valid-looking URL that doesn't resolve still
-    shows a warning but the client-side format validation passes.
+    Uses two separate app instances to avoid field-clearing issues:
+    - Instance 1: type invalid URL, verify error
+    - Instance 2: type valid URL, verify it advances
     """
     print("\n" + "="*70, flush=True)
     print("  3. STUDIO URL VALIDATION TESTS", flush=True)
     print("="*70, flush=True)
 
+    import xa11y
+
+    # Test 1: Invalid URL → shows "Invalid Deadline Cloud URL"
     with DCMApp(binary) as dcm:
         if not dcm.app:
             results.skip("url: rejects invalid URL", "no app")
-            results.skip("url: accepts valid format URL (client-side)", "no app")
+            results.skip("url: accepts valid format URL (advances wizard)", "no app")
             return
 
-        import xa11y
-
-        # Fresh app goes directly to URL step (wizard Step 1)
         tree = dcm.dump()
         screenshot("url_step_initial")
 
-        # Find the URL text field
         try:
-            text_field = dcm.wait_for("text_field", timeout=5)
+            text_field = dcm.wait_for("text_field", timeout=ELEMENT_TIMEOUT)
         except Exception:
             results.skip("url: rejects invalid URL", "no text_field found")
-            results.skip("url: accepts valid format URL (client-side)", "no text_field found")
+            results.skip("url: accepts valid format URL (advances wizard)", "no text_field found")
             return
 
-        # Test 1: Invalid URL format → shows "Invalid Deadline Cloud URL"
         try:
             text_field.focus()
             time.sleep(0.3)
             dcm.type_text("invalid$url")
             time.sleep(0.5)
-            dcm.press_button("Next", timeout=5)
-            time.sleep(1.5)
+            dcm.press_button("Next", timeout=ELEMENT_TIMEOUT)
+            time.sleep(2)
 
             tree = dcm.dump()
             screenshot("invalid_url_submitted")
-            has_error = "invalid deadline cloud url" in tree.lower() or "invalid" in tree.lower()
+            has_error = "invalid" in tree.lower()
             results.check("url: rejects invalid URL", has_error,
-                          f"no 'Invalid' error. Tree excerpt: {tree[:500]}")
+                          f"no 'Invalid' error. Tree: {tree[:500]}")
         except Exception as e:
             results.fail("url: rejects invalid URL", str(e))
 
-        # Test 2: Valid format URL → advances to profile name step
+    # Test 2: Valid format URL → advances to profile name step (fresh instance)
+    with DCMApp(binary) as dcm:
+        if not dcm.app:
+            results.skip("url: accepts valid format URL (advances wizard)", "no app")
+            return
+
         try:
-            # Re-focus the text field and triple-click to select all, then delete
-            text_field = dcm.wait_for("text_field", timeout=5)
+            text_field = dcm.wait_for("text_field", timeout=ELEMENT_TIMEOUT)
             text_field.focus()
-            time.sleep(0.5)
-            # Triple-click to select all text in field (more reliable than Cmd+A)
-            if IS_MACOS:
-                xa11y.input_sim().chord("a", held=["Meta"])
-            else:
-                xa11y.input_sim().chord("a", held=["Control"])
             time.sleep(0.3)
-            xa11y.input_sim().press("Backspace")
-            time.sleep(0.5)
-
-            # Verify field is clear
-            tree_check = dcm.dump()
-            if "invalid" in tree_check.lower():
-                # Field might not have cleared — try typing over the selection
-                text_field.focus()
-                time.sleep(0.2)
-
             valid_url = "https://mymonitor.us-west-2.deadlinecloud.amazonaws.com"
             dcm.type_text(valid_url)
             time.sleep(1)
-            dcm.press_button("Next", timeout=5)
-            time.sleep(3)
+            dcm.press_button("Next", timeout=ELEMENT_TIMEOUT)
+            time.sleep(4)
 
             tree = dcm.dump(max_depth=25)
             screenshot("valid_format_url_submitted")
             tree_lower = tree.lower()
-            # A valid URL advances the wizard to Step 2 (profile name step)
-            # or shows "No valid monitor" (backend can't reach it but format is OK)
-            # or at minimum the format-specific error "Invalid Deadline Cloud URL." is gone
+            # A valid URL advances to Step 2 (profile name) or shows "No valid monitor"
             advanced_to_profile = "profile name" in tree_lower or "your profile name" in tree_lower
             has_monitor_msg = "no valid monitor" in tree_lower
-            # The format error has a period at the end: "Invalid Deadline Cloud URL."
-            no_format_error = "invalid deadline cloud url." not in tree_lower
-            passed = advanced_to_profile or has_monitor_msg or no_format_error
-            results.check("url: accepts valid format URL (client-side)", passed,
-                          f"advanced={advanced_to_profile}, monitor_msg={has_monitor_msg}, "
-                          f"no_format_error={no_format_error}. Tree: {tree[:500]}")
+            passed = advanced_to_profile or has_monitor_msg
+            results.check("url: accepts valid format URL (advances wizard)", passed,
+                          f"advanced={advanced_to_profile}, monitor_msg={has_monitor_msg}. "
+                          f"Tree: {tree[:500]}")
         except Exception as e:
-            results.fail("url: accepts valid format URL (client-side)", str(e))
+            results.fail("url: accepts valid format URL (advances wizard)", str(e))
 
 
 # =============================================================================

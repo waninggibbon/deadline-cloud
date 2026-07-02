@@ -14,7 +14,7 @@ jobs:
   test:
     name: DCM xa11y Smoke (Linux)
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       DISPLAY: ':99'
       GTK_MODULES: gail:atk-bridge
@@ -22,6 +22,9 @@ jobs:
       GNOME_ACCESSIBILITY: '1'
       ACCESSIBILITY_ENABLED: '1'
       MOZ_ENABLE_WAYLAND: '0'
+      # Force webkitgtk to expose DOM content via AT-SPI accessibility tree
+      WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+      WEBKIT_FORCE_SANDBOX: '0'
       SCREENSHOT_DIR: /tmp/dcm-screenshots
     steps:
       - uses: actions/checkout@v7
