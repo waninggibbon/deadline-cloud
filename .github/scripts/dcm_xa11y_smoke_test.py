@@ -222,7 +222,12 @@ class DCMApp:
     def dump(self, max_depth=20):
         if not self.app:
             return ""
-        return self.app.dump(max_depth=max_depth)
+        tree = self.app.dump(max_depth=max_depth)
+        # If tree is shallow (no web content yet), wait and retry
+        if "web_area" not in tree and "button" not in tree:
+            time.sleep(5)
+            tree = self.app.dump(max_depth=max_depth)
+        return tree
 
     def locator(self, selector):
         return self.app.locator(selector)
@@ -252,6 +257,13 @@ class DCMApp:
 
     def type_text(self, text):
         import xa11y
+        # Ensure our window is focused before typing
+        try:
+            window = self.app.locator("window")
+            window.focus()
+            time.sleep(0.2)
+        except Exception:
+            pass
         sim = xa11y.input_sim()
         sim.type_text(text)
 

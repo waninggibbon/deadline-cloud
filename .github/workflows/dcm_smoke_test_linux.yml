@@ -39,7 +39,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb dbus-x11 at-spi2-core \
-            libayatana-appindicator3-1 libwebkit2gtk-4.0-37 desktop-file-utils
+            libayatana-appindicator3-1 libwebkit2gtk-4.0-37 desktop-file-utils \
+            libatk-bridge2.0-0 libatspi2.0-0 libgtk-3-0 gir1.2-atspi-2.0
 
       - name: Start Xvfb + session bus + AT-SPI
         run: |
@@ -48,6 +49,8 @@ jobs:
           eval "$(dbus-launch --sh-syntax)"
           echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
           /usr/libexec/at-spi-bus-launcher --launch-immediately &
+          sleep 1
+          /usr/libexec/at-spi2-registryd &
           sleep 2
 
       - name: Install xa11y
