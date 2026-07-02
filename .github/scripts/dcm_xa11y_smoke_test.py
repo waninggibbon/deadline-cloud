@@ -441,7 +441,7 @@ def run_gui_tests(binary):
                 print(f"    [DEBUG] WEBKIT_A11Y_BUS_ADDRESS={os.environ.get('WEBKIT_A11Y_BUS_ADDRESS', '<not set>')}", flush=True)
                 print(f"    [DEBUG] AT_SPI_BUS_ADDRESS={os.environ.get('AT_SPI_BUS_ADDRESS', '<not set>')}", flush=True)
                 print(f"    [DEBUG] DBUS_SESSION_BUS_ADDRESS={os.environ.get('DBUS_SESSION_BUS_ADDRESS', '<not set>')}", flush=True)
-                # Try querying the AT-SPI bus to see if webkitgtk's web process registered
+                # Query AT-SPI bus
                 try:
                     import subprocess as _sp
                     r = _sp.run(["dbus-send", "--session", "--dest=org.a11y.Bus", "--print-reply",
@@ -450,6 +450,38 @@ def run_gui_tests(binary):
                     print(f"    [DEBUG] GetAddress result: {r.stdout.strip()}", flush=True)
                 except Exception as e:
                     print(f"    [DEBUG] GetAddress failed: {e}", flush=True)
+                # Check if web process child is running
+                try:
+                    import subprocess as _sp
+                    r = _sp.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
+                    web_procs = [l for l in r.stdout.split("\n") if "WebKitWebProcess" in l or "webkit" in l.lower()]
+                    print(f"    [DEBUG] WebKit web processes ({len(web_procs)}):", flush=True)
+                    for p in web_procs[:5]:
+                        print(f"      {p.strip()}", flush=True)
+                except Exception as e:
+                    print(f"    [DEBUG] ps failed: {e}", flush=True)
+                # Check webkitgtk version
+                try:
+                    import subprocess as _sp
+                    r = _sp.run(["dpkg", "-s", "libwebkit2gtk-4.0-37"], capture_output=True, text=True, timeout=5)
+                    for line in r.stdout.split("\n"):
+                        if line.startswith("Version:"):
+                            print(f"    [DEBUG] {line}", flush=True)
+                            break
+                except Exception as e:
+                    print(f"    [DEBUG] dpkg failed: {e}", flush=True)
+                # Check if the AT-SPI bus socket is accessible
+                try:
+                    import subprocess as _sp
+                    bus_path = os.environ.get("WEBKIT_A11Y_BUS_ADDRESS", "")
+                    if "unix:path=" in bus_path:
+                        socket_path = bus_path.split("unix:path=")[1].split(",")[0]
+                        r = _sp.run(["ls", "-la", socket_path], capture_output=True, text=True, timeout=5)
+                        print(f"    [DEBUG] AT-SPI socket: {r.stdout.strip()}", flush=True)
+                        if r.returncode != 0:
+                            print(f"    [DEBUG] Socket not accessible: {r.stderr.strip()}", flush=True)
+                except Exception as e:
+                    print(f"    [DEBUG] socket check failed: {e}", flush=True)
                 # List all apps in the AT-SPI tree
                 print(f"    [DEBUG] All a11y apps:", flush=True)
                 for a in xa11y.App.list():
