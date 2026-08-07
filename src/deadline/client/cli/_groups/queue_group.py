@@ -30,6 +30,7 @@ from ....job_attachments.models import (
 from .click_logger import ClickLogger
 from .._main import deadline as main
 from .._incremental_download import _incremental_output_download
+from .._download_status_file import write_download_status_file
 from .._pid_file_lock import PidFileLock
 from ....job_attachments._incremental_downloads.incremental_download_state import (
     IncrementalDownloadState,
@@ -92,7 +93,10 @@ def queue_list(**args):
     "--mode",
     type=click.Choice(["USER", "READ"], case_sensitive=False),
     default="USER",
-    help="The type of queue role to assume (default: USER)",
+    help="Which queue role to assume: USER (default) assumes the queue's user "
+    "role, giving the operator-level access used to submit jobs and monitor job "
+    "status; READ assumes the queue's read-only role for viewing job status and "
+    "queue information without the ability to submit or modify jobs.",
 )
 @click.option(
     "--output-format",
@@ -373,6 +377,7 @@ def sync_output(
 
     if ignore_storage_profiles:
         local_storage_profile_id = None
+        local_storage_profile = None
         logger.echo("Ignoring all storage profiles.")
     else:
         local_storage_profile_id = config_file.get_setting(
@@ -422,6 +427,7 @@ def sync_output(
     logger.echo()
 
     if local_storage_profile_id:
+        assert local_storage_profile is not None
         logger.echo(
             f"Mapping job output paths to the local storage profile {local_storage_profile['displayName']} ({local_storage_profile_id})"
         )
@@ -429,6 +435,23 @@ def sync_output(
         for location in local_storage_profile["fileSystemLocations"]:
             logger.echo(f"    {location['name']}: {location['path']}")
         logger.echo()
+
+    # Pre-flight validation: warn about inaccessible storage profile locations.
+    # Downloads proceed regardless — jobs only map to the locations their outputs fall under,
+    # and the status file writer already tolerates per-location write failures gracefully.
+    if local_storage_profile_id and local_storage_profile:
+        for location in local_storage_profile["fileSystemLocations"]:
+            location_path = location["path"]
+            if not os.path.isdir(location_path):
+                logger.echo(
+                    f"WARNING: File system location '{location['name']}' does not exist: {location_path}"
+                    " — status file will not be written to this location."
+                )
+            elif not os.access(location_path, os.W_OK):
+                logger.echo(
+                    f"WARNING: File system location '{location['name']}' is not writable: {location_path}"
+                    " — status file will not be written to this location."
+                )
 
     # Perform incremental download while holding a process id lock
 
@@ -453,6 +476,16 @@ def sync_output(
             # Print the bootstrap time in local time
             if force_bootstrap:
                 logger.echo(f"Bootstrap forced, lookback is {bootstrap_lookback_minutes} minutes")
+                # Also clear the failed jobs tracker so abandoned jobs get a fresh start
+                storage_profile_key = local_storage_profile_id or "ignore-storage-profiles"
+                failed_jobs_file = os.path.join(
+                    checkpoint_dir,
+                    f"{queue_id}_{storage_profile_key}_failed_jobs.json",
+                )
+                try:
+                    os.unlink(failed_jobs_file)
+                except OSError:
+                    pass  # File doesn't exist — nothing to clear
             else:
                 logger.echo(
                     f"Checkpoint not found, lookback is {bootstrap_lookback_minutes} minutes"
@@ -485,19 +518,40 @@ def sync_output(
 
         logger.echo()
 
-        updated_download_state: IncrementalDownloadState = _incremental_output_download(
+        (
+            updated_download_state,
+            categorized_job_ids,
+            download_candidate_jobs,
+            job_download_results,
+            task_download_results,
+            succeeded_task_ids,
+        ) = _incremental_output_download(
             boto3_session=boto3_session,
             farm_id=farm_id,
             queue=queue,
             checkpoint=checkpoint,
             file_conflict_resolution=FileConflictResolution[conflict_resolution],
+            checkpoint_dir=checkpoint_dir,
             config=config,
             print_function_callback=logger.echo,
             dry_run=dry_run,
         )
 
-        # Save the checkpoint file if it's not a dry run
+        # Save status file and checkpoint if it's not a dry run
         if not dry_run:
+            write_download_status_file(
+                queue_id=queue_id,
+                categorized_job_ids=categorized_job_ids,
+                download_candidate_jobs=download_candidate_jobs,
+                local_storage_profile_id=local_storage_profile_id,
+                local_storage_profile=local_storage_profile if local_storage_profile_id else None,
+                checkpoint_dir=checkpoint_dir,
+                job_download_results=job_download_results,
+                task_download_results=task_download_results,
+                succeeded_task_ids=succeeded_task_ids,
+                print_function_callback=logger.echo,
+            )
+
             updated_download_state.save_file(checkpoint_file_path)
             logger.echo("Checkpoint saved")
         else:

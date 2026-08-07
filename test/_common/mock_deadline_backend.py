@@ -85,6 +85,7 @@ class MockDeadlineBackend:
         self.sessions: dict[tuple, dict] = {}
         self.session_actions: dict[tuple, dict] = {}
         self.storage_profiles: dict[tuple, dict] = {}
+        self.monitors: dict[str, dict] = {}  # monitorId -> monitor
         self.call_counts: dict[str, int] = {}
         self.batch_call_sizes: dict[str, list[int]] = {}
         self._job_environments: dict[str, list[str]] = {}  # job_id -> [env_name, ...]
@@ -106,6 +107,7 @@ class MockDeadlineBackend:
         self.tasks.clear()
         self.sessions.clear()
         self.session_actions.clear()
+        self.monitors.clear()
         self.call_counts.clear()
         self.batch_call_sizes.clear()
         self._job_environments.clear()
@@ -284,6 +286,40 @@ class MockDeadlineBackend:
         self._validate("ListFarms", params)
         return {"farms": list(self.farms.values())}
 
+    # ========== Monitor APIs ==========
+
+    def create_monitor(
+        self,
+        *,
+        subdomain: str,
+        region: str = "us-west-2",
+        displayName: str = "Test Monitor",
+        **kwargs,
+    ) -> dict:
+        """Seed a monitor. Not an HTTP route (no CreateMonitor call is made by the
+        client under test); tests use this to set up GetMonitor responses."""
+        monitor_id = self._gen_id("monitor")
+        self.monitors[monitor_id] = {
+            "monitorId": monitor_id,
+            "displayName": displayName,
+            "subdomain": subdomain,
+            "url": f"https://{subdomain}.{region}.deadlinecloud.amazonaws.com",
+            "roleArn": "arn:aws:iam::123456789012:role/MonitorRole",
+            "identityCenterInstanceArn": "arn:aws:sso:::instance/ssoins-mock",
+            "identityCenterApplicationArn": "arn:aws:sso::123456789012:application/ssoins-mock/apl-mock",
+            "createdAt": self._now(),
+            "createdBy": "mock-user",
+            **kwargs,
+        }
+        return self.monitors[monitor_id]
+
+    @route("GET", "/monitors/{monitorId}", "GetMonitor")
+    def get_monitor(self, *, monitorId: str) -> dict:
+        self._validate("GetMonitor", {"monitorId": monitorId})
+        if monitorId not in self.monitors:
+            raise _resource_not_found("monitor", monitorId, "GetMonitor")
+        return self.monitors[monitorId]
+
     # ========== Queue APIs ==========
 
     @route("POST", "/farms/{farmId}/queues", "CreateQueue")
@@ -390,6 +426,10 @@ class MockDeadlineBackend:
     def create_storage_profile(
         self, *, farmId: str, queueId: str, displayName: str, osFamily: str = "LINUX", **kwargs
     ) -> dict:
+        # clear() drops storage_profiles (it's treated as an ad-hoc attr), while the
+        # read path uses getattr(..., {}); re-create it here so writes after a clear work.
+        if not hasattr(self, "storage_profiles"):
+            self.storage_profiles = {}
         sp_id = self._gen_id("sp")
         self.storage_profiles[(farmId, queueId, sp_id)] = {
             "storageProfileId": sp_id,
@@ -1268,19 +1308,28 @@ def _make_handler(routes, validator, backend):
     return _Handler
 
 
-def start_server(backend: "MockDeadlineBackend", port: int = 0):
+def start_server(backend: "MockDeadlineBackend", port: int = 0, ssl_context=None):
     """Start the HTTP server in a daemon thread. Returns (server, base_url, thread).
 
     Binds to 127.0.0.1. Callers pointing the ``deadline`` CLI at this server via
     ``AWS_ENDPOINT_URL_DEADLINE`` must also disable botocore's ``management.``
     host-prefix injection for Deadline API calls (e.g. via the sitecustomize
     shim in ``test_cli_fleet_worker_subprocess.py``).
+
+    If ``ssl_context`` (an ``ssl.SSLContext``) is provided, the listening socket
+    is wrapped for TLS and the returned base URL uses the ``https`` scheme. This
+    lets the backend stand in for the real (TLS) Deadline endpoint, e.g. when
+    exercising proxy / CA-bundle behavior end-to-end.
     """
     routes = _discover_routes(backend)
     validator = _ResponseValidator()
     handler_cls = _make_handler(routes, validator, backend)
     server = _HTTPServer(("127.0.0.1", port), handler_cls)
     actual_port = server.server_address[1]
+    scheme = "http"
+    if ssl_context is not None:
+        server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
     thread = _threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    return server, f"http://127.0.0.1:{actual_port}", thread
+    return server, f"{scheme}://127.0.0.1:{actual_port}", thread

@@ -69,6 +69,23 @@ class _PrivateClass:  # Private
     pass
 ```
 
+### Comments
+
+Prefer clear code over comments — rename, extract, or restructure before adding
+one. Comment only where the code can't be made clear on its own. Comments are
+terse, explain *why* not *what*, and are stateless: no history, past approaches,
+or migrations (git holds that).
+
+```python
+# DON'T
+# previously we used urllib, now we use requests  (history)
+count += 1  # increment count  (restates the code)
+
+# DO
+# STS is eventually consistent right after role creation.
+resp = retry_once(fetch)
+```
+
 ### Commit Messages
 Use [conventional commits](https://www.conventionalcommits.org/):
 - `feat:` - New features
@@ -78,6 +95,21 @@ Use [conventional commits](https://www.conventionalcommits.org/):
 - `refactor:` - Code refactoring
 - `perf:` - Performance improvements
 - `feat!:` or `fix!:` - Breaking changes (Also include `BREAKING CHANGES:` section in message body)
+
+### CLI `--output` format auto-detection
+
+Commands that take `--output verbose|json` auto-detect the format when the
+option is omitted: `verbose` at an interactive terminal, `json` otherwise
+(pipes, redirection, CI, agents). An explicit `--output` always wins. Resolve
+this with the shared `_resolve_output_format()` helper and the
+`_OUTPUT_FORMAT_HELP` text rather than hand-rolling the default per command.
+
+### Cross-region: two regions are in play
+
+The farm's region (`defaults.farm_region`, used by `get_boto3_client`) can differ
+from the profile/monitor's region. Farm-scoped APIs (CreateJob etc.) need the farm
+region; monitor-scoped APIs (GetMonitor) need the profile region — don't reuse a
+client across that boundary, and test region-sensitive code with the two set differently.
 
 ### CHANGELOG.md is auto-generated — do not edit it
 

@@ -1,3 +1,50 @@
+## 0.60.3 (2026-07-27)
+
+### Bug Fixes
+* `DeadlineLoginDialog.login()` now correctly returns `True` on successful login. Previously it always returned `False` due to comparing against the wrong dialog result code, breaking the documented `if ...login():` usage pattern. (#1289)
+* Fixed a crash (`UnboundLocalError`) when saving a debug snapshot for a job bundle that has no attachments during `create_job_from_job_bundle`. (#1290)
+* Fixed data loss in the config dialog: editing a known-asset path to a duplicate value no longer silently drops the original row. Also fixed a boolean setting data loss issue. (#1291)
+* The `job trace-schedule` command no longer crashes with `ZeroDivisionError` when run against in-flight or partial jobs that have no completed session durations or zero session actions. (#1293)
+* Fixed a security issue where the known-path containment check during job bundle submission used an unanchored prefix match. A known root like `/trusted/project` would incorrectly suppress warnings for paths in sibling directories like `/trusted/project-secret/file`. The check is now properly anchored. (#1294)
+* Fixed a privacy issue where the telemetry stack-trace sanitizer could leak customer directory names if they happened to share a name with framework packages (e.g., a project directory named `deadline`). Such paths are now properly redacted. (#1295)
+* The minimum `click` dependency has been raised to >= 8.3.3 on Python 3.10+ to address CVE-2026-7246. While deadline-cloud was not directly vulnerable, this resolves security scanner flags. (#1283)
+## 0.60.2 (2026-07-20)
+
+### BREAKING CHANGES
+* The public API functions in `deadline.client.api` (`get_job`, `get_session`, `list_sessions`, `list_steps`, `list_tasks`, `search_jobs`) now use camelCase parameter names (matching boto3 / Deadline Cloud API style) instead of snake_case. Update any calls to these functions to use camelCase parameter names. Old snake_case names still work but emit a DeprecationWarning; they will be removed in the next breaking release. Passing both forms of a parameter raises TypeError. (#1271)
+
+### Features
+* Added a public `get_monitor_url()` helper to `deadline.client.api` that formats an AWS Deadline Cloud monitor (web console) URL from a region and optional farm/queue/job/step/task IDs. After job submission, the job URL is now surfaced to the user. (#1272)
+* The `sync-output` command now writes a download status JSON file, allowing external tools to track download progress. (#1220)
+* Added a unified `BaseSubmitter` abstract base class, `BaseSubmitterSettings`, `SubmissionContext`, and `get_queue_parameters()` to `deadline.client.api`. Pipeline integrators can now call a uniform set of methods on any DCC submitter without importing DCC-specific modules. (#1245)
+
+### Bug Fixes
+* Fixed the submitter status bar showing overly long text ("{profile} - You are logged out.") in the profile button when logged out, which caused clipping at default scaling or narrow window widths. The profile button now shows only the profile name. (#1270)
+## 0.60.1 (2026-07-10)
+
+### Features
+* Farm, queue, and storage profile can now be selected directly in the job submission dialog's "Shared job settings" tab, eliminating the need to open the Settings dialog before submitting a job. (#1199)
+* Added `settings.https_proxy` and `settings.ca_bundle` config settings, allowing you to configure HTTPS proxy and CA certificate bundle for Deadline Cloud API calls via `deadline config set` instead of process-wide environment variables. (#1217)
+* Added a Qt-free `run_pre_gui_hooks` API in `deadline.client.ui.pre_gui_hooks`, enabling DCC submitters (e.g. Maya, Nuke) to run pre-GUI submission hooks without requiring Qt bindings. (#1255)
+
+### Bug Fixes
+* Fixed an issue where switching farms in the job submitter caused the queue and storage profile combo boxes to display stale raw IDs instead of clearing properly. (#1263)
+* Fixed submission hooks so that both environment (DEADLINE_HOOKS_DIR) and bundle pre/post-submission hooks now run together correctly. Previously, only one set of hooks would execute when both were present. (#1261)
+* Submission hooks now stream stderr output to the user in real time while running, instead of buffering all output until the hook finishes (which made slow hooks appear to hang). (#1254)
+* Fixed an `UnboundLocalError` crash in `sync-output` when using `--ignore-storage-profiles` with unmapped paths by properly handling missing storage profile information. (#1260)
+## 0.60.0 (2026-07-06)
+
+### Features
+* The `--output` format for CLI commands now auto-detects based on whether stdout is a TTY. Interactive terminals default to `verbose` (human-readable) output, while pipes, redirection, and CI environments default to `json`. An explicit `--output` flag always takes precedence. This removes the need to pass `--output json` in scripts and automation. (#1237)
+## 0.59.2 (2026-07-03)
+
+### Features
+* Farms encrypted with a customer-managed KMS key (CMK) that reside in a different region than the monitor are now filtered out of the all-farms list, preventing interactions that would fail due to cross-region CMK limitations. (#1244)
+
+### Bug Fixes
+* Pre-submission hooks can now modify job parameters. Previously, parameters were frozen before hooks ran, so changes made by hooks (e.g., rewriting parameter_values.yaml or emitting a "parameters" payload on stdout) were silently ignored. Parameters are now re-resolved after hooks run. (#1242)
+* Pre-GUI environment hooks are now properly loaded during submission. (#1242)
+* Fixed cross-region API calls failing with SigV4 credential-scope mismatches when a non-standard endpoint override was configured in the AWS profile. The endpoint URL is now correctly regionalized for the target region. (#1233)
 ## 0.59.1 (2026-06-24)
 
 ### DEPRECATIONS

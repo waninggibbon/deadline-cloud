@@ -1,11 +1,17 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 from __future__ import annotations
 
-__all__ = ["_incremental_output_download"]
+__all__ = ["CategorizedJobIds", "_incremental_output_download"]
 
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 import difflib
+import errno
+import json
+import os
+import re
+import tempfile
+import threading
 from typing import Optional
 from configparser import ConfigParser
 from typing import Any, Callable
@@ -16,9 +22,11 @@ import textwrap
 from .. import api
 import boto3
 from botocore.client import BaseClient  # type: ignore[import]
+from botocore.exceptions import ClientError  # type: ignore[import]
 from ..api._list_jobs_by_filter_expression import _list_jobs_by_filter_expression
 from ..api._session import get_session_client, _resolve_region
 from ...job_attachments.api import summarize_path_list, human_readable_file_size
+from ...job_attachments._aws.aws_clients import get_s3_client as _get_s3_client
 from ...job_attachments._incremental_downloads.incremental_download_state import (
     IncrementalDownloadState,
     IncrementalDownloadJob,
@@ -27,8 +35,13 @@ from ...job_attachments._incremental_downloads.incremental_download_state import
 from ...job_attachments._incremental_downloads._manifest_s3_downloads import (
     _add_output_manifests_from_s3,
     _download_all_manifests_with_absolute_paths,
-    _merge_absolute_path_manifest_list,
+    _get_manifests_to_download,
     _download_manifest_paths,
+)
+from ...job_attachments.exceptions import (
+    AssetSyncCancelledError,
+    JobAttachmentsS3ClientError,
+    JobAttachmentS3BotoCoreError,
 )
 from ...job_attachments._path_mapping import (
     _generate_path_mapping_rules,
@@ -52,6 +65,160 @@ from ...job_attachments.progress_tracker import (
 from ._common import _cli_object_repr, sigint_handler
 
 SESSIONS_API_MAX_CONCURRENCY = 3
+
+
+def _classify_single_error(e: BaseException) -> Optional[str]:
+    """Classifies one exception from its own structured signals, or None if it has none."""
+    # job_attachments surfaces S3 failures as JobAttachmentsS3ClientError with an HTTP
+    # status code, and botocore transport failures as JobAttachmentS3BotoCoreError.
+    if isinstance(e, JobAttachmentsS3ClientError):
+        if e.status_code == 403:
+            return "PERMISSION_DENIED"
+        if e.status_code == 404:
+            return "PATH_NOT_FOUND"
+    if isinstance(e, JobAttachmentS3BotoCoreError):
+        return "NETWORK_ERROR"
+
+    if isinstance(e, PermissionError):
+        return "PERMISSION_DENIED"
+    if isinstance(e, OSError) and e.errno == errno.ENOSPC:
+        return "DISK_FULL"
+    if isinstance(e, FileNotFoundError):
+        return "PATH_NOT_FOUND"
+    if isinstance(e, (ConnectionError, TimeoutError)):
+        return "NETWORK_ERROR"
+
+    if isinstance(e, ClientError):
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in ("AccessDenied", "AccessDeniedException", "403", "Forbidden"):
+            return "PERMISSION_DENIED"
+        if error_code in ("NoSuchKey", "NoSuchBucket", "404", "NotFound"):
+            return "PATH_NOT_FOUND"
+        if error_code in ("RequestTimeout", "RequestTimeTooSkewed"):
+            return "NETWORK_ERROR"
+
+    return None
+
+
+def _classify_error(e: BaseException) -> str:
+    """Classifies a download exception into a standard error code.
+
+    Uses only structured signals — exception type, errno, S3 HTTP status codes, and
+    boto error codes — which are reliable. Message-substring matching is intentionally
+    avoided: wrapped S3 errors carry verbose guidance text that produces confidently
+    wrong codes. job_attachments wraps low-level failures (e.g. an OSError or a botocore
+    ClientError) inside its own exception types, so we also walk the exception chain to
+    reach the structured signal underneath. Anything without such a signal is UNKNOWN.
+    """
+    # Walk the chain iteratively, tracking visited exceptions by identity so a cyclic chain
+    # (A raised `from` B and B raised `from` A) can't cause infinite recursion.
+    #
+    # __cause__ (explicit `raise ... from`) is preferred, but fall back to __context__: much of
+    # job_attachments re-raises inside an `except` block without `from`, which records the
+    # original only as __context__. Following __cause__ alone reports UNKNOWN for those.
+    # __suppress_context__ (`raise ... from None`) means the author declared the inner error
+    # irrelevant, so honor it and stop rather than attaching a misleading code.
+    current: Optional[BaseException] = e
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        code = _classify_single_error(current)
+        if code is not None:
+            return code
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__suppress_context__:
+            break
+        else:
+            current = current.__context__
+
+    return "UNKNOWN"
+
+
+_MAX_FAILED_JOB_RETRIES = 5
+
+
+class _FailedJobsTracker:
+    """Persists per-job download failure counts so the global timestamp can advance freely.
+
+    When a job fails to download, it is tracked here instead of freezing the checkpoint
+    timestamp. On the next run, failed jobs are fetched individually via GetJob and merged
+    into the download candidates. After _MAX_FAILED_JOB_RETRIES attempts, the job is
+    abandoned and a warning is logged.
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self._file_path = file_path
+        self._counts: dict[str, int] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if os.path.exists(self._file_path):
+                with open(self._file_path, "r") as f:
+                    self._counts = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            self._counts = {}
+
+    def save(self) -> None:
+        dir_path = os.path.dirname(self._file_path)
+        tmp_path: Optional[str] = None
+        try:
+            os.makedirs(dir_path, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                json.dump(self._counts, f)
+            os.replace(tmp_path, self._file_path)
+            tmp_path = None  # Rename succeeded — no cleanup needed
+        except OSError:
+            pass  # Best-effort write — if the checkpoint dir is unwritable, skip silently
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass  # Best-effort cleanup of temp file
+
+    def get_tracked_job_ids(self) -> set[str]:
+        """Returns job IDs that should be retried (below the retry cap)."""
+        return {job_id for job_id, count in self._counts.items() if count < _MAX_FAILED_JOB_RETRIES}
+
+    def is_abandoned(self, job_id: str) -> bool:
+        """Returns True if the job has hit the retry cap and should not be retried."""
+        return self._counts.get(job_id, 0) >= _MAX_FAILED_JOB_RETRIES
+
+    def record_failures(
+        self, failed_job_ids: set[str], print_function_callback: Callable[[Any], None]
+    ) -> None:
+        for job_id in failed_job_ids:
+            self._counts[job_id] = self._counts.get(job_id, 0) + 1
+            if self._counts[job_id] >= _MAX_FAILED_JOB_RETRIES:
+                print_function_callback(
+                    f"WARNING: Job {job_id} has failed to download {_MAX_FAILED_JOB_RETRIES} "
+                    f"times and will no longer be retried automatically."
+                )
+                # Keep in _counts at the cap value so subsequent timestamp-window rediscoveries
+                # are suppressed — do NOT delete here.
+
+    def record_successes(self, succeeded_job_ids: set[str]) -> None:
+        for job_id in succeeded_job_ids:
+            self._counts.pop(job_id, None)
+
+
+# Anchor to the step-<id>/task-<id>/ layout rather than the first "task-" hit: the key is
+# prefixed with the queue's customer-controlled rootPrefix, so a prefix like "my-task-outputs/"
+# would otherwise be misread as the task id.
+_TASK_ID_RE = re.compile(r"step-[^/]+/(task-[^/]+)/")
+
+
+def _extract_task_id_from_s3_key(manifest_s3_key: str) -> Optional[str]:
+    """Extracts the task ID from an S3 manifest key path.
+
+    S3 manifest keys follow the pattern:
+    .../step-<id>/task-<id>/<timestamp>_<sessionActionId>/<hash>_output
+    """
+    match = _TASK_ID_RE.search(manifest_s3_key)
+    return match.group(1) if match else None
 
 
 @dataclass
@@ -364,10 +531,13 @@ def _categorize_jobs_in_checkpoint(
     for job_id in new_job_ids:
         dc_job = download_candidate_jobs[job_id]
 
-        # Call deadline:GetJob to retrieve attachments manifest information
-        job = deadline.get_job(jobId=job_id, queueId=queue_id, farmId=farm_id)
-        dc_job["attachments"] = job.get("attachments")
-        dc_job["storageProfileId"] = job.get("storageProfileId")
+        # Call deadline:GetJob to retrieve attachments manifest information, unless the candidate
+        # already carries it. Retried failed jobs are injected via GetJob upstream, so their
+        # attachments are already present — re-fetching here would be a redundant API call.
+        if "attachments" not in dc_job:
+            job = deadline.get_job(jobId=job_id, queueId=queue_id, farmId=farm_id)
+            dc_job["attachments"] = job.get("attachments")
+            dc_job["storageProfileId"] = job.get("storageProfileId")
         dc_succeeded_task_count = dc_job["taskRunStatusCounts"]["SUCCEEDED"]
         dc_total_task_count = sum(value for _, value in dc_job["taskRunStatusCounts"].items())
 
@@ -471,6 +641,8 @@ def _retrieve_session_actions_for_session(
     queue_id: str,
     job_id: str,
     output_session: dict[str, Any],
+    output_farm_failed_task_ids: Optional[set[str]] = None,
+    output_succeeded_task_ids: Optional[set[str]] = None,
 ):
     """
     Args:
@@ -482,6 +654,11 @@ def _retrieve_session_actions_for_session(
         queue_id: The queue id for the operation.
         job_id: The job id to process.
         output_session: The session to populate with a sessionActions field.
+        output_farm_failed_task_ids: Optional set populated with task IDs of taskRun actions that
+            FAILED on the farm. These produce no output to download and are recorded separately.
+        output_succeeded_task_ids: Optional set populated with task IDs of taskRun actions that
+            SUCCEEDED on the farm. Used to clear stale farm_failed entries for tasks that later
+            succeeded.
     """
     session_actions_paginator = deadline_client.get_paginator("list_session_actions")
 
@@ -492,12 +669,25 @@ def _retrieve_session_actions_for_session(
         jobId=job_id,
         sessionId=output_session["sessionId"],
     ):
-        # Include only succeeded taskRun actions.
         for session_action in session_actions_page.get("sessionActions", []):
-            succeeded = session_action.get("status") == "SUCCEEDED"
-            is_task_run = "taskRun" in session_action.get("definition", {})
-            if succeeded and is_task_run:
+            definition = session_action.get("definition", {})
+            if "taskRun" not in definition:
+                continue
+            status = session_action.get("status")
+            if status == "SUCCEEDED":
+                # Succeeded taskRun — has output to download.
                 session_action_list.append(session_action)
+                if output_succeeded_task_ids is not None:
+                    task_id = definition["taskRun"].get("taskId")
+                    if task_id:
+                        output_succeeded_task_ids.add(task_id)
+            elif status == "FAILED" and output_farm_failed_task_ids is not None:
+                # Failed on the farm — produced no output. Record the task id separately so the
+                # status file can show a stable "farm_failed" entry; never add it to
+                # session_action_list (that list drives manifest downloads).
+                task_id = definition["taskRun"].get("taskId")
+                if task_id:
+                    output_farm_failed_task_ids.add(task_id)
 
     if session_action_list:
         # Extract the session action indexes from the ids
@@ -531,10 +721,15 @@ def _get_job_sessions(
     download_candidate_jobs: dict[str, dict[str, Any]],
     print_function_callback: Callable[[Any], None] = lambda msg: None,
     region: Optional[str] = None,
-) -> dict[str, list]:
+) -> tuple[dict[str, list], dict[str, set[str]], dict[str, set[str]]]:
     """
     This function gets all the job sessions and session actions from the completed, added, and updated jobs.
     It uses the checkpoint's session_completed_indexes to filter out older session actions that are already downloaded.
+
+    Returns a tuple of (job_sessions, farm_failed_task_ids, succeeded_task_ids), where
+    farm_failed_task_ids maps job_id -> set of task IDs that FAILED on the farm (produced no
+    output to download), and succeeded_task_ids maps job_id -> set of task IDs that SUCCEEDED
+    (used to clear stale farm_failed entries written by a prior run).
 
     Args:
         boto3_session: The boto3.Session for accessing AWS.
@@ -640,19 +835,35 @@ def _get_job_sessions(
     print_function_callback(f"Using {max_workers} threads")
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
+        # Collect farm-failed task IDs per job across threads. Each worker collects into a
+        # local set, then merges under a lock — dict/set mutation across threads needs it.
+        farm_failed_task_ids: dict[str, set[str]] = {}
+        succeeded_task_ids: dict[str, set[str]] = {}
+        farm_failed_lock = threading.Lock()
+
+        def _retrieve_and_collect(job_id: str, session: dict[str, Any]) -> None:
+            local_failed: set[str] = set()
+            local_succeeded: set[str] = set()
+            _retrieve_session_actions_for_session(
+                deadline,
+                checkpoint_job_session_completed_indexes,
+                farm_id,
+                queue["queueId"],
+                job_id,
+                session,
+                local_failed,
+                local_succeeded,
+            )
+            if local_failed or local_succeeded:
+                with farm_failed_lock:
+                    if local_failed:
+                        farm_failed_task_ids.setdefault(job_id, set()).update(local_failed)
+                    if local_succeeded:
+                        succeeded_task_ids.setdefault(job_id, set()).update(local_succeeded)
+
         for job_id, session_list in job_sessions.items():
             for session in session_list:
-                futures.append(
-                    executor.submit(
-                        _retrieve_session_actions_for_session,
-                        deadline,
-                        checkpoint_job_session_completed_indexes,
-                        farm_id,
-                        queue["queueId"],
-                        job_id,
-                        session,
-                    )
-                )
+                futures.append(executor.submit(_retrieve_and_collect, job_id, session))
         # surfaces any exceptions in the thread
         for future in concurrent.futures.as_completed(futures):
             future.result()
@@ -677,7 +888,16 @@ def _get_job_sessions(
     duration = datetime.now(tz=timezone.utc) - start_time
     print_function_callback(f"...populated in {duration}")
 
-    return job_sessions
+    # A FAILED taskRun action is reported by the API indefinitely — even after the task is
+    # requeued and SUCCEEDED. Remove any task that has a SUCCEEDED action in this same run so
+    # a stale farm_failed does not overwrite a task whose output has since arrived on disk.
+    for job_id, s_ids in succeeded_task_ids.items():
+        if job_id in farm_failed_task_ids:
+            farm_failed_task_ids[job_id] -= s_ids
+            if not farm_failed_task_ids[job_id]:
+                del farm_failed_task_ids[job_id]
+
+    return job_sessions, farm_failed_task_ids, succeeded_task_ids
 
 
 def _get_storage_profiles(
@@ -987,11 +1207,19 @@ def _incremental_output_download(
     boto3_session: boto3.Session,
     checkpoint: IncrementalDownloadState,
     file_conflict_resolution: FileConflictResolution,
+    checkpoint_dir: str,
     config: Optional[ConfigParser] = None,
     print_function_callback: Callable[[Any], None] = lambda msg: None,
     *,
     dry_run: bool = False,
-) -> IncrementalDownloadState:
+) -> tuple[
+    IncrementalDownloadState,
+    CategorizedJobIds,
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, dict[str, Any]]],
+    dict[str, set[str]],
+]:
     """
     This function downloads all the task run outputs from the specified queue, that have become
     available since the last time the function was called. The checkpoint object
@@ -1015,7 +1243,8 @@ def _incremental_output_download(
         dry_run: If True, the operation will print out information but not perform any data downloads.
 
     Returns:
-        An updated checkpoint object.
+        A tuple of (updated checkpoint, categorized job IDs, download candidate jobs dict,
+        per-job download results, per-task download results).
     """
     durations = IncrementalOutputDownloadLatencies()
     # Operations here are within a single farm, so scope the deadline client to that
@@ -1063,17 +1292,65 @@ def _incremental_output_download(
         job.job_id: job.session_completed_indexes for job in checkpoint.jobs
     }
 
+    # Load failed jobs tracker — tracks jobs that failed in previous runs so the global
+    # timestamp can advance freely while still retrying failed jobs individually.
+    queue_id = queue["queueId"]
+    storage_profile_key = checkpoint.local_storage_profile_id or "ignore-storage-profiles"
+    failed_jobs_file = os.path.join(
+        checkpoint_dir, f"{queue_id}_{storage_profile_key}_failed_jobs.json"
+    )
+    failed_jobs_tracker = _FailedJobsTracker(failed_jobs_file)
+
     # Call deadline:SearchJobs to get a set of jobs that includes every job with downloads available.
     start_t = time.perf_counter_ns()
     download_candidate_jobs: dict[str, dict[str, Any]] = _get_download_candidate_jobs(
         boto3_session,
         farm_id,
-        queue["queueId"],
+        queue_id,
         checkpoint.downloads_completed_timestamp,
         print_function_callback,
         region=region,
     )
     durations._get_download_candidate_jobs = time.perf_counter_ns() - start_t
+
+    # Inject previously failed jobs that fell outside the timestamp window
+    previously_failed_job_ids = failed_jobs_tracker.get_tracked_job_ids()
+    if previously_failed_job_ids:
+        print_function_callback(
+            f"Retrying {len(previously_failed_job_ids)} previously failed job(s)..."
+        )
+        jobs_not_found: set[str] = set()
+        for job_id in previously_failed_job_ids:
+            if job_id not in download_candidate_jobs:
+                try:
+                    job = deadline.get_job(farmId=farm_id, queueId=queue_id, jobId=job_id)
+                    injected_job = _datetimes_to_str(job)
+                    # Normalize the attachments/storageProfileId keys so downstream
+                    # categorization can index them directly (and skip a redundant GetJob).
+                    injected_job.setdefault("attachments", job.get("attachments"))
+                    injected_job.setdefault("storageProfileId", job.get("storageProfileId"))
+                    download_candidate_jobs[job_id] = injected_job
+                except ClientError as e:
+                    if e.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                        # Job was deleted — remove from tracker to stop retrying
+                        jobs_not_found.add(job_id)
+                    # All other errors (throttling, network, auth) are transient — leave in tracker
+                except Exception:
+                    pass  # Unexpected error — leave in tracker to retry next run
+        if jobs_not_found:
+            failed_jobs_tracker.record_successes(jobs_not_found)
+            if not dry_run:
+                failed_jobs_tracker.save()
+
+    # Remove abandoned jobs (hit retry cap) from download candidates so they are not
+    # re-queued even when rediscovered via the timestamp window.
+    abandoned_job_ids = {
+        job_id
+        for job_id in list(download_candidate_jobs.keys())
+        if failed_jobs_tracker.is_abandoned(job_id)
+    }
+    for job_id in abandoned_job_ids:
+        del download_candidate_jobs[job_id]
 
     print_function_callback("")
 
@@ -1095,7 +1372,7 @@ def _incremental_output_download(
 
     # All the completed, added, and updated jobs might have downloads available. Retrieve the sessions for these jobs.
     start_t = time.perf_counter_ns()
-    job_sessions: dict[str, list] = _get_job_sessions(
+    job_sessions, farm_failed_task_ids, succeeded_task_ids = _get_job_sessions(
         boto3_session,
         boto3_session_for_s3,
         farm_id,
@@ -1110,6 +1387,7 @@ def _incremental_output_download(
     durations._get_job_sessions = time.perf_counter_ns() - start_t
 
     # If storage profiles are being used, get them and construct all the path mapping rules
+    storage_profiles: dict[str, dict[str, Any]] = {}
     path_mapping_rule_appliers: dict[str, Optional[_PathMappingRuleApplier]] = {}
     if checkpoint.local_storage_profile_id:
         start_t = time.perf_counter_ns()
@@ -1154,14 +1432,18 @@ def _incremental_output_download(
             print_function_callback(
                 f"    Job {download_candidate_jobs[job_id]['name']} ({job_id}) has outputs with unmapped paths that will not be downloaded"
             )
-            storage_profile = storage_profiles[download_candidate_jobs[job_id]["storageProfileId"]]
-            print_function_callback(
-                f"      Job storage profile is {storage_profile['displayName']} ({storage_profile['storageProfileId']})"
+            storage_profile = storage_profiles.get(
+                download_candidate_jobs[job_id].get("storageProfileId", "")
             )
+            if storage_profile is not None:
+                print_function_callback(
+                    f"      Job storage profile is {storage_profile['displayName']} ({storage_profile['storageProfileId']})"
+                )
             print_function_callback("      Summary of unmapped paths:")
             path_format = (
                 PathFormat.WINDOWS
-                if storage_profile["osFamily"] == StorageProfileOperatingSystemFamily.WINDOWS.value
+                if storage_profile is not None
+                and storage_profile["osFamily"] == StorageProfileOperatingSystemFamily.WINDOWS.value
                 else PathFormat.POSIX
             )
             paths_summary = summarize_path_list(
@@ -1169,15 +1451,100 @@ def _incremental_output_download(
             )
             print_function_callback(textwrap.indent(paths_summary, "      "))
 
-    # Merge the manifests ordered by the last modified timestamp
-    manifest_paths_to_download: list[BaseManifestPath] = _merge_absolute_path_manifest_list(
-        downloaded_manifests
+    # Build per-job file mapping by correlating downloaded manifests with their job IDs
+    manifests_to_download = _get_manifests_to_download(
+        queue["jobAttachmentSettings"]["rootPrefix"],
+        download_candidate_jobs,
+        job_sessions,
+        path_mapping_rule_appliers,
     )
+    # Correlate manifests_to_download with downloaded_manifests by position to attribute each
+    # downloaded manifest to its job (and task). Both lists come from _get_manifests_to_download
+    # with identical inputs, so their lengths match in practice. If they ever diverge we skip only
+    # the per-job/per-task attribution — the downloads still proceed via the fallback bucket below,
+    # so a mismatch degrades reporting but never causes a silent zero-download run. (Downloads are
+    # decoupled from attribution: what gets downloaded comes from downloaded_manifests either way;
+    # attribution is best-effort layered on top.)
+    skip_attribution = len(manifests_to_download) != len(downloaded_manifests)
+    if skip_attribution:
+        print_function_callback(
+            f"WARNING: Manifest list length mismatch ({len(manifests_to_download)} vs "
+            f"{len(downloaded_manifests)}) — per-job and per-task download tracking will not "
+            f"be populated for this run; files will still be downloaded."
+        )
+    job_manifest_paths: dict[str, list[BaseManifestPath]] = {}
+    # job_id -> task_id -> [files]: used for per-task download tracking
+    job_task_manifest_paths: dict[str, dict[str, list[BaseManifestPath]]] = {}
+    # job_id -> task_id -> [file_paths]: every path originally attributed to each task. Unlike
+    # job_task_manifest_paths this keeps the paths a newer job took ownership of, so a losing job
+    # can still report its filesystem-derived status in the deduped-job block below. Built as
+    # dict keys (an ordered set) to dedup a file that reappears across manifests via task retry.
+    task_file_paths: dict[str, dict[str, dict[str, None]]] = {}
+    if not skip_attribution:
+        # Visit manifests oldest-to-newest by their S3 LastModified timestamp so the last write of
+        # any shared path wins. downloaded_manifests is filled positionally (correlated to
+        # manifests_to_download by index) and is NOT pre-sorted, so derive the order here.
+        records = sorted(
+            (
+                (
+                    downloaded_manifests[i][0],
+                    manifests_to_download[i][1],  # job_id
+                    manifests_to_download[i][3],  # manifest_s3_key
+                    downloaded_manifests[i][1],  # manifest
+                )
+                for i in range(len(manifests_to_download))
+                if downloaded_manifests[i] is not None
+            ),
+            key=lambda record: record[0],
+        )
+        # normcased destination path -> the (job, task) that wrote it last. Overwriting the key IS
+        # the dedup rule: exactly one job and one task owns each path, so a path emitted by several
+        # manifests — a task retry, a requeue under a new task, or two jobs sharing an output path —
+        # is downloaded once and counted once. Without this, parallel threads could write the same
+        # path simultaneously and corrupt it under OVERWRITE. Because we iterate oldest-to-newest,
+        # the surviving owner is the newest writer. Content correctness is unaffected: jobs sharing
+        # a path render the same bytes, so only the job_id credited in the status file differs, and
+        # a job that loses a path still reports accurate status via the filesystem check below.
+        path_owner: dict[str, tuple[str, Optional[str], BaseManifestPath]] = {}
+        for _, job_id, manifest_s3_key, manifest in records:
+            task_id = _extract_task_id_from_s3_key(manifest_s3_key)
+            for manifest_path in manifest.paths:
+                path_owner[os.path.normcase(manifest_path.path)] = (job_id, task_id, manifest_path)
+                if task_id:
+                    task_file_paths.setdefault(job_id, {}).setdefault(task_id, {})[
+                        manifest_path.path
+                    ] = None
+        for job_id, task_id, manifest_path in path_owner.values():
+            job_manifest_paths.setdefault(job_id, []).append(manifest_path)
+            if task_id:
+                job_task_manifest_paths.setdefault(job_id, {}).setdefault(task_id, []).append(
+                    manifest_path
+                )
+    else:
+        # Attribution skipped: download everything anyway, decoupled from per-job tracking.
+        # Collect every downloaded path (deduped) under a synthetic bucket keyed by "" so it
+        # never collides with a real job id. Per-job (and per-task) counts aren't populated this
+        # run, but no files are lost; the "" bucket feeds the run-level stats and never becomes a
+        # per-job status entry.
+        fallback_paths: dict[str, BaseManifestPath] = {}
+        for manifest_tuple in downloaded_manifests:
+            if manifest_tuple is not None:
+                _, manifest = manifest_tuple
+                for manifest_path in manifest.paths:
+                    fallback_paths.setdefault(os.path.normcase(manifest_path.path), manifest_path)
+        if fallback_paths:
+            job_manifest_paths[""] = list(fallback_paths.values())
+
+    all_task_file_paths: dict[str, dict[str, list[str]]] = {
+        job_id: {task_id: list(paths) for task_id, paths in task_map.items()}
+        for job_id, task_map in task_file_paths.items()
+    }
 
     # Print a summary of all the paths before starting the download
-    local_path_list = [manifest_path.path for manifest_path in manifest_paths_to_download]
+    all_manifest_paths = [path for paths in job_manifest_paths.values() for path in paths]
+    local_path_list = [manifest_path.path for manifest_path in all_manifest_paths]
     file_size_by_path = {
-        manifest_path.path: manifest_path.size for manifest_path in manifest_paths_to_download
+        manifest_path.path: manifest_path.size for manifest_path in all_manifest_paths
     }
     print_function_callback("")
     print_function_callback("Summary of paths to download:")
@@ -1186,43 +1553,263 @@ def _incremental_output_download(
     )
     print_function_callback("")
 
+    # Download per-job with error isolation, running jobs in parallel to restore throughput.
+    job_download_results: dict[str, dict[str, Any]] = {}
+    # task_download_results: job_id -> task_id -> {total_files, downloaded_files, error_code, error_message, download_status?}
+    # download_status is optional: absent means "derive from error_code"; "farm_failed" is set
+    # explicitly for tasks that failed on the farm (no download was attempted).
+    task_download_results: dict[str, dict[str, dict[str, Any]]] = {}
+    # Set when the synthetic "" fallback bucket (attribution skipped) failed to download —
+    # gates the timestamp advance below so the lost window is re-attempted next run.
+    fallback_download_failed = False
+
     if not dry_run:
-        print_function_callback(f"Downloading {len(manifest_paths_to_download)} files from S3...")
+        total_files = sum(len(paths) for paths in job_manifest_paths.values())
+        print_function_callback(
+            f"Downloading {total_files} files from S3 across {len(job_manifest_paths)} jobs..."
+        )
         start_t = time.perf_counter_ns()
         start_time = datetime.now(tz=timezone.utc)
 
-        # Incremental download is mostly a background thing, so don't print status too often while downloading
-        MIN_DELAY_BETWEEN_PRINTOUTS = 20
-        last_call_time = time.time() - MIN_DELAY_BETWEEN_PRINTOUTS
-        printed_100_percent = False
+        # Pre-warm the S3 client so all threads hit the lru_cache and share one
+        # pre-built client — avoids concurrent session.client() calls across threads.
+        _get_s3_client(session=boto3_session_for_s3)
 
-        def _update_download_progress(
-            download_metadata: ProgressReportMetadata,
-        ) -> bool:
-            nonlocal last_call_time, printed_100_percent
+        print_lock = threading.Lock()
 
-            if not printed_100_percent and download_metadata.progress == 100:
-                print_function_callback(f"{download_metadata.progressMessage}")
-                last_call_time = time.time()
-                printed_100_percent = True
-            elif (
-                not printed_100_percent
-                and time.time() - last_call_time > MIN_DELAY_BETWEEN_PRINTOUTS
-            ):
-                print_function_callback(f"{download_metadata.progressMessage}")
-                last_call_time = time.time()
+        def _download_job(job_id: str, job_files: list) -> dict[str, Any]:
+            job_name = download_candidate_jobs.get(job_id, {}).get("name", job_id)
+            with print_lock:
+                print_function_callback(f"  Downloading {len(job_files)} files for job: {job_name}")
 
-            return sigint_handler.continue_operation
+            MIN_DELAY_BETWEEN_PRINTOUTS = 20
 
-        _download_manifest_paths(
-            manifest_paths_to_download,
-            HashAlgorithm.XXH128,
-            queue,
-            boto3_session_for_s3,
-            file_conflict_resolution,
-            on_downloading_files=_update_download_progress,
-            print_function_callback=print_function_callback,
-        )
+            def _make_progress_callback() -> Callable[[ProgressReportMetadata], bool]:
+                # Fresh state per download call: the per-job loop below invokes one
+                # download per task, and the 100%-printed latch must reset each time or
+                # every task after the first would print no progress at all.
+                last_call_time = time.time() - MIN_DELAY_BETWEEN_PRINTOUTS
+                printed_100_percent = False
+
+                def _update_download_progress(
+                    download_metadata: ProgressReportMetadata,
+                ) -> bool:
+                    nonlocal last_call_time, printed_100_percent
+                    if not printed_100_percent and download_metadata.progress == 100:
+                        with print_lock:
+                            print_function_callback(f"    {download_metadata.progressMessage}")
+                        last_call_time = time.time()
+                        printed_100_percent = True
+                    elif (
+                        not printed_100_percent
+                        and time.time() - last_call_time > MIN_DELAY_BETWEEN_PRINTOUTS
+                    ):
+                        with print_lock:
+                            print_function_callback(f"    {download_metadata.progressMessage}")
+                        last_call_time = time.time()
+                    return sigint_handler.continue_operation
+
+                return _update_download_progress
+
+            job_task_results: dict[str, dict[str, Any]] = {}
+            job_error_code: Optional[str] = None
+            job_error_message: Optional[str] = None
+
+            task_map = job_task_manifest_paths.get(job_id, {})
+            fallback_succeeded = False
+            leftover_downloaded = 0
+            leftover_failed = 0
+            if task_map:
+                # Per-task isolation: download each task independently so individual
+                # task failures don't mark succeeded tasks as failed.
+                for task_id, task_files in task_map.items():
+                    try:
+                        _download_manifest_paths(
+                            task_files,
+                            HashAlgorithm.XXH128,
+                            queue,
+                            boto3_session_for_s3,
+                            file_conflict_resolution,
+                            on_downloading_files=_make_progress_callback(),
+                            print_function_callback=print_function_callback,
+                        )
+                        if not sigint_handler.continue_operation:
+                            raise AssetSyncCancelledError("File download cancelled.")
+                        job_task_results[task_id] = {
+                            "total_files": len(task_files),
+                            "downloaded_files": len(task_files),
+                            "error_code": None,
+                            "error_message": None,
+                        }
+                    except AssetSyncCancelledError:
+                        raise
+                    except Exception as e:
+                        error_code = _classify_error(e)
+                        with print_lock:
+                            print_function_callback(
+                                f"  ERROR downloading task {task_id} for job {job_name}: {e}"
+                            )
+                        job_task_results[task_id] = {
+                            "total_files": len(task_files),
+                            "downloaded_files": sum(
+                                1 for f in task_files if os.path.exists(f.path)
+                            ),
+                            "error_code": error_code,
+                            "error_message": str(e),
+                        }
+                        if job_error_code is None:
+                            job_error_code = error_code
+                            job_error_message = str(e)
+
+                # Some of a job's paths may not carry a step-/task- segment in their manifest key
+                # (e.g. chunked-step manifests), so they were never attributed to a task and land
+                # in job_files but never in task_map. Downloading only the per-task files would
+                # silently skip them while the job still reports success and advances the
+                # checkpoint — the files would never be retried. Download those leftovers too.
+                task_owned = {
+                    os.path.normcase(f.path) for files in task_map.values() for f in files
+                }
+                leftover_files = [
+                    f for f in job_files if os.path.normcase(f.path) not in task_owned
+                ]
+                if leftover_files:
+                    try:
+                        _download_manifest_paths(
+                            leftover_files,
+                            HashAlgorithm.XXH128,
+                            queue,
+                            boto3_session_for_s3,
+                            file_conflict_resolution,
+                            on_downloading_files=_make_progress_callback(),
+                            print_function_callback=print_function_callback,
+                        )
+                        if not sigint_handler.continue_operation:
+                            raise AssetSyncCancelledError("File download cancelled.")
+                        leftover_downloaded = len(leftover_files)
+                    except AssetSyncCancelledError:
+                        raise
+                    except Exception as e:
+                        error_code = _classify_error(e)
+                        with print_lock:
+                            print_function_callback(
+                                f"  ERROR downloading unattributed files for job {job_name} ({job_id}): {e}"
+                            )
+                        leftover_downloaded = sum(
+                            1 for f in leftover_files if os.path.exists(f.path)
+                        )
+                        leftover_failed = len(leftover_files) - leftover_downloaded
+                        if job_error_code is None:
+                            job_error_code = error_code
+                            job_error_message = str(e)
+
+            else:
+                # No task attribution available — fall back to per-job download
+                try:
+                    _download_manifest_paths(
+                        job_files,
+                        HashAlgorithm.XXH128,
+                        queue,
+                        boto3_session_for_s3,
+                        file_conflict_resolution,
+                        on_downloading_files=_make_progress_callback(),
+                        print_function_callback=print_function_callback,
+                    )
+                    if not sigint_handler.continue_operation:
+                        raise AssetSyncCancelledError("File download cancelled.")
+                    fallback_succeeded = True
+                except AssetSyncCancelledError:
+                    raise
+                except Exception as e:
+                    job_error_code = _classify_error(e)
+                    job_error_message = str(e)
+                    with print_lock:
+                        print_function_callback(
+                            f"  ERROR downloading job {job_name} ({job_id}): {e}"
+                        )
+
+            if job_task_results:
+                # Per-task path: derive counts from task results directly to avoid
+                # inconsistencies from len(job_files) vs sum of per-task file lists.
+                # Add any non-task-attributed leftover paths downloaded above.
+                downloaded_count = (
+                    sum(r["downloaded_files"] for r in job_task_results.values())
+                    + leftover_downloaded
+                )
+                failed_count = (
+                    sum(
+                        r["total_files"]
+                        for r in job_task_results.values()
+                        if r["error_code"] is not None
+                    )
+                    - sum(
+                        r["downloaded_files"]
+                        for r in job_task_results.values()
+                        if r["error_code"] is not None
+                    )
+                    + leftover_failed
+                )
+            elif fallback_succeeded:
+                # Fallback path success: all files downloaded, use exact count.
+                downloaded_count = len(job_files)
+                failed_count = 0
+            else:
+                # Fallback path failure: use filesystem check for partial progress.
+                downloaded_count = sum(1 for f in job_files if os.path.exists(f.path))
+                failed_count = len(job_files) - downloaded_count
+
+            # Bytes actually written. On full success sum the manifest sizes directly; on any
+            # failure an isolated task may have downloaded only some of its files, so consult the
+            # filesystem so a partially-failed job's succeeded bytes are counted, not dropped.
+            if job_error_code is None:
+                downloaded_bytes = sum(f.size for f in job_files)
+            else:
+                downloaded_bytes = sum(f.size for f in job_files if os.path.exists(f.path))
+
+            return {
+                "total_files": len(job_files),
+                "downloaded_files": downloaded_count,
+                "downloaded_bytes": downloaded_bytes,
+                "failed_files": failed_count,
+                "error_code": job_error_code,
+                "error_message": job_error_message,
+                "task_results": job_task_results,
+            }
+
+        cancelled = False
+        # Bound concurrency to avoid S3 throttling and socket exhaustion — each
+        # _download_manifest_paths call has its own internal thread pool, so total
+        # S3 fan-out is max_workers × per-call threads.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=SESSIONS_API_MAX_CONCURRENCY
+        ) as executor:
+            future_to_job = {
+                executor.submit(_download_job, job_id, job_files): job_id
+                for job_id, job_files in job_manifest_paths.items()
+            }
+            for future in concurrent.futures.as_completed(future_to_job):
+                job_id = future_to_job[future]
+                try:
+                    result = future.result()
+                    task_results = result.pop("task_results", {})
+                    job_download_results[job_id] = result
+                    if task_results:
+                        task_download_results[job_id] = task_results
+                except AssetSyncCancelledError:
+                    cancelled = True
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+
+        if cancelled:
+            raise AssetSyncCancelledError("File download cancelled.")
+
+        # The synthetic fallback bucket (used when attribution was skipped) is retained in
+        # job_download_results so the run-level file/byte stats and the success/failure signal are
+        # computed from it — dropping it would report zero downloads (on success) or a false
+        # success (on failure) for a run that actually moved the full window. It is never a real
+        # job id, so it stays out of the per-job status entries (built from categorized_job_ids
+        # only) and the failed-jobs tracker (comprehensions below skip falsy job ids). On failure
+        # the flag also holds the timestamp back so the lost window is re-attempted next run.
+        fallback_download_failed = job_download_results.get("", {}).get("error_code") is not None
 
         durations.download = time.perf_counter_ns() - start_t
         duration = datetime.now(tz=timezone.utc) - start_time
@@ -1230,8 +1817,139 @@ def _incremental_output_download(
     else:
         print_function_callback("Skipping downloads due to DRY RUN")
 
-    # Update the timestamp in the state object to reflect the downloads that were completed
-    checkpoint.downloads_completed_timestamp = new_completed_timestamp
+    # For jobs whose paths were entirely claimed by a newer job (cross-job dedup),
+    # generate task results based on what's actually on disk. The winning job may have
+    # partially failed, so we check the filesystem rather than assuming all downloaded.
+    # When files are missing, reuse the winning job's error for the specific path (same
+    # path, same root cause) so all jobs sharing a path show a consistent error. This
+    # scales to mixed errors — each path maps to its own winning task's error.
+    if not dry_run:
+        # Build path -> (error_code, error_message) from every winning job's per-task results.
+        # A path belongs to the winning job that downloaded it; that task's error explains
+        # why the file is (or isn't) on disk.
+        path_error_map: dict[str, tuple[Optional[str], Optional[str]]] = {}
+        for win_job_id, win_task_results in task_download_results.items():
+            win_task_paths = all_task_file_paths.get(win_job_id, {})
+            for win_task_id, win_result in win_task_results.items():
+                err_code = win_result.get("error_code")
+                if err_code is not None:
+                    for p in win_task_paths.get(win_task_id, []):
+                        path_error_map[os.path.normcase(p)] = (
+                            err_code,
+                            win_result.get("error_message"),
+                        )
+
+        for job_id, task_paths_map in all_task_file_paths.items():
+            if job_id not in job_download_results and job_id not in task_download_results:
+                deduped_task_results: dict[str, dict[str, Any]] = {}
+                for task_id, file_paths in task_paths_map.items():
+                    on_disk = sum(1 for p in file_paths if os.path.exists(p))
+                    if on_disk == len(file_paths):
+                        deduped_task_results[task_id] = {
+                            "total_files": len(file_paths),
+                            "downloaded_files": len(file_paths),
+                            "error_code": None,
+                            "error_message": None,
+                        }
+                    else:
+                        # Inherit the winning job's actual error for a missing path (could be
+                        # PERMISSION_DENIED, DISK_FULL, NETWORK_ERROR, etc.). Fall back to
+                        # UNKNOWN only when no winning job reported an error for this path —
+                        # the file is missing but this run has no attempt explaining why.
+                        err_code = "UNKNOWN"
+                        err_msg = "Output files not found on disk"
+                        for p in file_paths:
+                            if not os.path.exists(p):
+                                mapped = path_error_map.get(os.path.normcase(p))
+                                if mapped is not None and mapped[0] is not None:
+                                    err_code = mapped[0]
+                                    err_msg = mapped[1] or err_msg
+                                    break
+                        deduped_task_results[task_id] = {
+                            "total_files": len(file_paths),
+                            "downloaded_files": on_disk,
+                            "error_code": err_code,
+                            "error_message": err_msg,
+                        }
+                task_download_results[job_id] = deduped_task_results
+
+    # Record tasks that FAILED on the farm as "farm_failed" entries. These produced no output
+    # to download, so they'd otherwise be absent from the status file — forcing the FE to rely
+    # on live run-status data that flips on requeue. A stable file entry fixes that.
+    # "farm_failed" (distinct from "failed", which is a download error) tells the artist the
+    # render itself failed — a different cause and fix than a download failure. It's also
+    # distinct from a task that succeeded with no output (those stay absent from the dict).
+    # Skip a task if a real download result already exists for it this run.
+    # Gated under not dry_run so dry runs don't mutate task_download_results, which is returned
+    # and passed to write_download_status_file — that call is also skipped on dry runs, but
+    # keeping the dict clean avoids confusion if callers inspect it on a dry run.
+    if not dry_run:
+        for job_id, task_ids in farm_failed_task_ids.items():
+            job_task_results = task_download_results.setdefault(job_id, {})
+            for task_id in task_ids:
+                if task_id not in job_task_results:
+                    job_task_results[task_id] = {
+                        "total_files": 0,
+                        "downloaded_files": 0,
+                        "error_code": None,
+                        "error_message": None,
+                        "download_status": "farm_failed",
+                    }
+
+    # Synthesize job_download_results for deduped jobs so _determine_job_download_status
+    # sees their file counts and errors. These jobs share output paths with the winning
+    # job — their status reflects what's actually on disk.
+    for job_id in list(task_download_results.keys()):
+        if job_id not in job_download_results:
+            task_results = task_download_results[job_id]
+            total = sum(r["total_files"] for r in task_results.values())
+            downloaded = sum(r["downloaded_files"] for r in task_results.values())
+            any_error = next((r for r in task_results.values() if r.get("error_code")), None)
+            job_download_results[job_id] = {
+                "total_files": total,
+                "downloaded_files": downloaded,
+                # These paths were downloaded by (and counted under) the winning job, so the
+                # run-level byte total must not count them again here.
+                "downloaded_bytes": 0,
+                "failed_files": total - downloaded,
+                "error_code": any_error["error_code"] if any_error else None,
+                "error_message": any_error["error_message"] if any_error else None,
+            }
+
+    # Remove failed jobs from checkpoint so they're treated as new (added) next run.
+    # Track them in the failed jobs file so they're retried even after the timestamp advances.
+    # The synthetic "" fallback bucket (kept above only when it failed) is not a real job, so it
+    # is excluded here — it must never reach the checkpoint filter or the failed-jobs tracker. Its
+    # retry is driven by the held-back timestamp (fallback_download_failed), not per-job tracking.
+    failed_job_ids = {
+        job_id
+        for job_id, r in job_download_results.items()
+        if job_id and r.get("error_code") is not None
+    }
+    succeeded_job_ids = {
+        job_id
+        for job_id, r in job_download_results.items()
+        if job_id and r.get("error_code") is None
+    }
+    # Any previously-tracked job that was in this run's candidate set but produced no result
+    # entry (e.g. deleted, attachments_free, missing storage profile, or all paths claimed by
+    # cross-job dedup) should be cleared from the tracker — no retry needed.
+    previously_failed_attempted = previously_failed_job_ids & set(download_candidate_jobs.keys())
+    succeeded_job_ids |= previously_failed_attempted - failed_job_ids
+    if failed_job_ids:
+        checkpoint.jobs = [job for job in checkpoint.jobs if job.job_id not in failed_job_ids]
+        failed_jobs_tracker.record_failures(failed_job_ids, print_function_callback)
+    failed_jobs_tracker.record_successes(succeeded_job_ids)
+    if not dry_run:
+        failed_jobs_tracker.save()
+
+    # Always advance the timestamp — failed jobs are tracked separately so they don't
+    # pin the global window. This prevents a single stuck job from degrading the entire queue.
+    # Exception: when attribution was skipped, there is no per-job tracker entry to carry a
+    # failed download's retry, so the global window is the only retry lever — hold it back on
+    # a fallback failure so the lost outputs are re-attempted next run.
+    if not fallback_download_failed:
+        checkpoint.downloads_completed_timestamp = new_completed_timestamp
 
     stats: dict[str, Any] = {
         "downloaded_session_actions": sum(
@@ -1239,8 +1957,30 @@ def _incremental_output_download(
             for session_list in job_sessions.values()
             for session in session_list
         ),
-        "downloaded_files": len(manifest_paths_to_download),
-        "downloaded_bytes": sum(path.size for path in manifest_paths_to_download),
+        # On dry runs job_download_results is empty — fall back to job_manifest_paths so the
+        # summary reports the count/size of files that would be downloaded (the preview value).
+        # Restrict to jobs that actually owned a download this run (job_id in job_manifest_paths)
+        # so deduped jobs — whose files were downloaded and counted under the winning job — are
+        # not counted twice. Per-task isolation makes partial success normal, so we no longer gate
+        # out a job that carries an error_code: a job where only one task failed still downloaded
+        # its other tasks' files, and dropping the whole job would undercount those to zero.
+        "downloaded_files": sum(
+            r.get("downloaded_files", 0)
+            for job_id, r in job_download_results.items()
+            if job_id in job_manifest_paths
+        )
+        if not dry_run
+        else sum(len(paths) for paths in job_manifest_paths.values()),
+        # For a fully-successful job (error_code None) every path was downloaded — sum all sizes
+        # without touching the filesystem. For a partially-failed job, count only the paths that
+        # actually landed on disk so the byte total isn't dropped to zero (or over-counted).
+        "downloaded_bytes": sum(
+            r.get("downloaded_bytes", 0)
+            for job_id, r in job_download_results.items()
+            if job_id in job_manifest_paths
+        )
+        if not dry_run
+        else sum(path.size for paths in job_manifest_paths.values() for path in paths),
         "jobs_with_downloads": {
             "completed": len(categorized_job_ids.completed),
             "added": len(categorized_job_ids.added),
@@ -1289,4 +2029,11 @@ def _incremental_output_download(
     print_function_callback(f"    unchanged: {stats['jobs_without_downloads']['unchanged']}")
     print_function_callback(f"    inactive: {stats['jobs_without_downloads']['inactive']}")
 
-    return checkpoint
+    return (
+        checkpoint,
+        categorized_job_ids,
+        download_candidate_jobs,
+        job_download_results,
+        task_download_results,
+        succeeded_task_ids,
+    )

@@ -33,6 +33,7 @@ __all__ = [  # noqa: RUF022  grouped by feature, not sorted
     "check_deadline_api_available",
     "get_credentials_source",
     "get_user_and_identity_store_id",
+    "build_monitor_url",
     "precache_clients",
     "list_farms",
     "list_queues",
@@ -67,6 +68,11 @@ __all__ = [  # noqa: RUF022  grouped by feature, not sorted
     "safe_check_for_updates",
     "UpdateCheckResult",
     "UpdateCheckStatus",
+    # Unified Submitter API
+    "BaseSubmitter",
+    "BaseSubmitterSettings",
+    "SubmissionContext",
+    "get_queue_parameters",
 ]
 
 # The following import is needed to prevent the following sporadic failure:
@@ -76,7 +82,6 @@ import encodings.idna  # noqa # pylint: disable=unused-import
 from configparser import ConfigParser
 from logging import getLogger
 from typing import Optional
-
 
 # Telemetry must be imported before Submit Job Bundle to avoid circular dependencies.
 from ._telemetry import (
@@ -98,6 +103,7 @@ from ._session import (
     get_credentials_source,
     get_user_and_identity_store_id,
 )
+from ._monitor_urls import build_monitor_url
 from ._list_apis import (
     list_farms,
     list_queues,
@@ -138,6 +144,12 @@ from ._update_checker import (
     safe_check_for_updates,
     UpdateCheckResult,
     UpdateCheckStatus,
+)
+from ._submitter import (
+    BaseSubmitter,
+    BaseSubmitterSettings,
+    SubmissionContext,
+    get_queue_parameters,
 )
 
 logger = getLogger(__name__)

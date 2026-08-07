@@ -35,9 +35,12 @@ classifiers = [
 # limiting dependencies if they want/need to.
 dependencies = [
   "boto3 >= 1.42.89",
-  "click >= 8.1.7",
+  # click 8.3.3 (CVE-2026-7246 fix) requires Python >= 3.10; keep the best
+  # available for 3.9 (not exploitable here — click.edit() is unused).
+  "click >= 8.3.3; python_version >= '3.10'",
+  "click >= 8.1.7; python_version < '3.10'",
   "pyyaml >= 6.0",
-  "deadline-job-attachments == 0.1.1",
+  "deadline-job-attachments == 0.1.3",
   "typing_extensions >= 4.8",
   "psutil >= 7.0.0",
   "QtPy == 2.4.*",
@@ -53,7 +56,7 @@ gui = [
   "PySide6-essentials >= 6.6,< 6.11",
 ]
 mcp = [
-  "mcp >= 1.13.0",
+  "mcp >= 1.13.0, < 2",
 ]
 
 [project.scripts]
@@ -117,7 +120,10 @@ line-length = 100
 
 [tool.ruff.lint]
 # F822 (undefined name in __all__) is on by default; RUF022 keeps __all__ sorted.
-extend-select = ["RUF022"]
+# E402 (imports must be at the top of the file) is pinned explicitly here so it
+# can't silently regress if a future ruff drops it from the defaults; it is
+# build-failing via `hatch run lint`.
+extend-select = ["RUF022", "E402"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
